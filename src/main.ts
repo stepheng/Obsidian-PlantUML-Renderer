@@ -119,9 +119,12 @@ class PlantUMLPipe {
 // Plugin
 // ---------------------------------------------------------------------------
 
+const CACHE_LIMIT = 30;
+
 export default class PlantUMLRendererPlugin extends Plugin {
     settings: Settings;
     private pipe: PlantUMLPipe | null = null;
+    private svgCache = new Map<string, string>();
 
     async onload() {
         await this.loadSettings();
@@ -138,6 +141,7 @@ export default class PlantUMLRendererPlugin extends Plugin {
 
     startPipe() {
         this.pipe?.kill();
+        this.svgCache.clear();
         this.pipe = this.settings.jarPath
             ? new PlantUMLPipe(this.settings.javaPath, this.settings.jarPath, this.settings.dotPath)
             : null;
@@ -147,24 +151,30 @@ export default class PlantUMLRendererPlugin extends Plugin {
         try {
             if (!this.pipe) throw new Error('JAR path not configured — set it in plugin settings.');
             const resolved = await this.resolveIncludes(source, ctx.sourcePath);
-            const svg = await this.pipe.render(resolved);
-            const container = el.createDiv({ cls: 'plantuml-container' });
-            const svgMatch = svg.match(/<svg[\s\S]*<\/svg>/i);
-            container.innerHTML = svgMatch ? svgMatch[0] : svg;
-
-            const svgEl = container.querySelector('svg');
-            if (svgEl) this.makeZoomable(container, svgEl as HTMLElement);
-
-            if (svg.includes('Syntax Error?')) {
-                const svgStart = svg.indexOf('<svg');
-                const errorText = (svgStart > 0 ? svg.slice(0, svgStart).trim() : '')
-                    || [...svg.matchAll(/<text[^>]*>([^<]+)<\/text>/g)]
-                        .map(m => m[1].replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>'))
-                        .filter(t => t.trim())
-                        .join('\n');
-                if (errorText) {
-                    container.createEl('pre', { text: errorText.replace(/↵/g, '\n'), cls: 'plantuml-error-text' });
+            let svg = this.svgCache.get(resolved);
+            if (!svg) {
+                svg = await this.pipe.render(resolved);
+                if (this.svgCache.size >= CACHE_LIMIT) {
+                    this.svgCache.delete(this.svgCache.keys().next().value!);
                 }
+                this.svgCache.set(resolved, svg);
+            }
+            const svgContent = (svg.match(/<svg[\s\S]*<\/svg>/i) ?? [svg])[0];
+
+            // Use viewBox as the authoritative content dimensions — width/height attributes
+            // are in pt (e.g. "504pt"), which has a different px equivalent to the SVG user units.
+            const vb = svgContent.match(/viewBox="[\d.]+ [\d.]+ ([\d.]+) ([\d.]+)"/);
+            const W = vb ? parseFloat(vb[1]) : parseFloat(svgContent.match(/\bwidth="([\d.]+)"/)?.[1] ?? '800');
+            const H = vb ? parseFloat(vb[2]) : parseFloat(svgContent.match(/\bheight="([\d.]+)"/)?.[1] ?? '600');
+
+            const container = el.createDiv({ cls: 'plantuml-container' });
+            container.innerHTML = svgContent;
+
+            const svgEl = container.querySelector('svg') as HTMLElement | null;
+            if (svgEl) {
+                svgEl.removeAttribute('width');
+                svgEl.removeAttribute('height');
+                this.makeZoomable(container, svgEl, W, H);
             }
         } catch (err) {
             el.createEl('pre', {
@@ -174,19 +184,15 @@ export default class PlantUMLRendererPlugin extends Plugin {
         }
     }
 
-    private makeZoomable(container: HTMLElement, svgEl: HTMLElement) {
-        const W = parseFloat(svgEl.getAttribute('width') ?? '800');
-        const H = parseFloat(svgEl.getAttribute('height') ?? '600');
-
-        if (!svgEl.hasAttribute('viewBox')) {
-            svgEl.setAttribute('viewBox', `0 0 ${W} ${H}`);
-        }
-        svgEl.removeAttribute('width');
-        svgEl.removeAttribute('height');
-        svgEl.style.width = `${W}px`;
-        svgEl.style.height = `${H}px`;
-        svgEl.style.display = 'block';
-        svgEl.style.transformOrigin = '0 0';
+    private makeZoomable(container: HTMLElement, target: HTMLElement, W: number, H: number) {
+        // Absolute positioning takes the SVG out of normal flow so growing its
+        // width/height for zoom doesn't affect container layout.
+        target.style.position = 'absolute';
+        target.style.top = '0';
+        target.style.left = '0';
+        target.style.display = 'block';
+        // willChange for translate — zoom is handled by resizing the element itself
+        target.style.willChange = 'transform';
 
         Object.assign(container.style, {
             overflow: 'hidden',
@@ -222,7 +228,6 @@ export default class PlantUMLRendererPlugin extends Plugin {
 
         let scale = 1, tx = 0, ty = 0, minScale = 0.05;
 
-        // Clamp pan so diagram edges never retreat inside the container
         const clamp = () => {
             const cw = container.clientWidth;
             const ch = container.clientHeight;
@@ -230,9 +235,24 @@ export default class PlantUMLRendererPlugin extends Plugin {
             ty = Math.min(0, Math.max(ty, ch - H * scale));
         };
 
-        const apply = () => {
+        // Pan: translate only — GPU composited, no layout
+        const applyTranslate = () => {
+            target.style.transform = `translate3d(${tx}px,${ty}px,0)`;
+        };
+
+        // Zoom: resize the element so SVG re-rasterises at the correct resolution
+        // (translate scale() just enlarges the existing texture — blurry when zoomed in)
+        let zoomRafPending = false;
+        const applyZoom = () => {
             clamp();
-            svgEl.style.transform = `translate(${tx}px,${ty}px) scale(${scale})`;
+            target.style.width = `${W * scale}px`;
+            target.style.height = `${H * scale}px`;
+            applyTranslate();
+        };
+        const scheduleZoom = () => {
+            if (zoomRafPending) return;
+            zoomRafPending = true;
+            requestAnimationFrame(() => { zoomRafPending = false; applyZoom(); });
         };
 
         // Initial fit-to-width; size container to the scaled diagram height
@@ -242,7 +262,7 @@ export default class PlantUMLRendererPlugin extends Plugin {
             minScale = scale;
             const maxH = window.innerHeight * 0.6;
             container.style.height = `${Math.min(H * scale, maxH)}px`;
-            apply();
+            applyZoom();
         });
 
         // Cmd+scroll to zoom toward cursor; plain scroll scrolls the page
@@ -257,10 +277,10 @@ export default class PlantUMLRendererPlugin extends Plugin {
             tx = mx - (mx - tx) * (newScale / scale);
             ty = my - (my - ty) * (newScale / scale);
             scale = newScale;
-            apply();
+            scheduleZoom();
         }, { passive: false });
 
-        // Drag to pan
+        // Drag to pan — translate only, stays on compositor
         let dragging = false, dragX = 0, dragY = 0, startTx = 0, startTy = 0;
 
         container.addEventListener('pointerdown', (e: PointerEvent) => {
@@ -276,7 +296,8 @@ export default class PlantUMLRendererPlugin extends Plugin {
             if (!dragging) return;
             tx = startTx + (e.clientX - dragX);
             ty = startTy + (e.clientY - dragY);
-            apply();
+            clamp();
+            applyTranslate();
         });
 
         container.addEventListener('pointerup', () => {
@@ -288,7 +309,7 @@ export default class PlantUMLRendererPlugin extends Plugin {
         container.addEventListener('dblclick', () => {
             scale = minScale;
             tx = 0; ty = 0;
-            apply();
+            applyZoom();
         });
     }
 

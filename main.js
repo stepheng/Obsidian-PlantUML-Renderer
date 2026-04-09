@@ -109,10 +109,12 @@ ${item.source}
     });
   }
 };
+var CACHE_LIMIT = 30;
 var PlantUMLRendererPlugin = class extends import_obsidian.Plugin {
   constructor() {
     super(...arguments);
     this.pipe = null;
+    this.svgCache = /* @__PURE__ */ new Map();
   }
   async onload() {
     await this.loadSettings();
@@ -129,24 +131,33 @@ var PlantUMLRendererPlugin = class extends import_obsidian.Plugin {
   startPipe() {
     var _a;
     (_a = this.pipe) == null ? void 0 : _a.kill();
+    this.svgCache.clear();
     this.pipe = this.settings.jarPath ? new PlantUMLPipe(this.settings.javaPath, this.settings.jarPath, this.settings.dotPath) : null;
   }
   async render(source, el, ctx) {
+    var _a, _b, _c, _d, _e;
     try {
       if (!this.pipe) throw new Error("JAR path not configured \u2014 set it in plugin settings.");
       const resolved = await this.resolveIncludes(source, ctx.sourcePath);
-      const svg = await this.pipe.render(resolved);
-      const container = el.createDiv({ cls: "plantuml-container" });
-      const svgMatch = svg.match(/<svg[\s\S]*<\/svg>/i);
-      container.innerHTML = svgMatch ? svgMatch[0] : svg;
-      const svgEl = container.querySelector("svg");
-      if (svgEl) this.makeZoomable(container, svgEl);
-      if (svg.includes("Syntax Error?")) {
-        const svgStart = svg.indexOf("<svg");
-        const errorText = (svgStart > 0 ? svg.slice(0, svgStart).trim() : "") || [...svg.matchAll(/<text[^>]*>([^<]+)<\/text>/g)].map((m) => m[1].replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")).filter((t) => t.trim()).join("\n");
-        if (errorText) {
-          container.createEl("pre", { text: errorText.replace(/↵/g, "\n"), cls: "plantuml-error-text" });
+      let svg = this.svgCache.get(resolved);
+      if (!svg) {
+        svg = await this.pipe.render(resolved);
+        if (this.svgCache.size >= CACHE_LIMIT) {
+          this.svgCache.delete(this.svgCache.keys().next().value);
         }
+        this.svgCache.set(resolved, svg);
+      }
+      const svgContent = ((_a = svg.match(/<svg[\s\S]*<\/svg>/i)) != null ? _a : [svg])[0];
+      const vb = svgContent.match(/viewBox="[\d.]+ [\d.]+ ([\d.]+) ([\d.]+)"/);
+      const W = vb ? parseFloat(vb[1]) : parseFloat((_c = (_b = svgContent.match(/\bwidth="([\d.]+)"/)) == null ? void 0 : _b[1]) != null ? _c : "800");
+      const H = vb ? parseFloat(vb[2]) : parseFloat((_e = (_d = svgContent.match(/\bheight="([\d.]+)"/)) == null ? void 0 : _d[1]) != null ? _e : "600");
+      const container = el.createDiv({ cls: "plantuml-container" });
+      container.innerHTML = svgContent;
+      const svgEl = container.querySelector("svg");
+      if (svgEl) {
+        svgEl.removeAttribute("width");
+        svgEl.removeAttribute("height");
+        this.makeZoomable(container, svgEl, W, H);
       }
     } catch (err) {
       el.createEl("pre", {
@@ -155,19 +166,12 @@ var PlantUMLRendererPlugin = class extends import_obsidian.Plugin {
       });
     }
   }
-  makeZoomable(container, svgEl) {
-    var _a, _b;
-    const W = parseFloat((_a = svgEl.getAttribute("width")) != null ? _a : "800");
-    const H = parseFloat((_b = svgEl.getAttribute("height")) != null ? _b : "600");
-    if (!svgEl.hasAttribute("viewBox")) {
-      svgEl.setAttribute("viewBox", `0 0 ${W} ${H}`);
-    }
-    svgEl.removeAttribute("width");
-    svgEl.removeAttribute("height");
-    svgEl.style.width = `${W}px`;
-    svgEl.style.height = `${H}px`;
-    svgEl.style.display = "block";
-    svgEl.style.transformOrigin = "0 0";
+  makeZoomable(container, target, W, H) {
+    target.style.position = "absolute";
+    target.style.top = "0";
+    target.style.left = "0";
+    target.style.display = "block";
+    target.style.willChange = "transform";
     Object.assign(container.style, {
       overflow: "hidden",
       cursor: "grab",
@@ -206,9 +210,23 @@ var PlantUMLRendererPlugin = class extends import_obsidian.Plugin {
       tx = Math.min(0, Math.max(tx, cw - W * scale));
       ty = Math.min(0, Math.max(ty, ch - H * scale));
     };
-    const apply = () => {
+    const applyTranslate = () => {
+      target.style.transform = `translate3d(${tx}px,${ty}px,0)`;
+    };
+    let zoomRafPending = false;
+    const applyZoom = () => {
       clamp();
-      svgEl.style.transform = `translate(${tx}px,${ty}px) scale(${scale})`;
+      target.style.width = `${W * scale}px`;
+      target.style.height = `${H * scale}px`;
+      applyTranslate();
+    };
+    const scheduleZoom = () => {
+      if (zoomRafPending) return;
+      zoomRafPending = true;
+      requestAnimationFrame(() => {
+        zoomRafPending = false;
+        applyZoom();
+      });
     };
     requestAnimationFrame(() => {
       const cw = container.clientWidth || W;
@@ -216,7 +234,7 @@ var PlantUMLRendererPlugin = class extends import_obsidian.Plugin {
       minScale = scale;
       const maxH = window.innerHeight * 0.6;
       container.style.height = `${Math.min(H * scale, maxH)}px`;
-      apply();
+      applyZoom();
     });
     container.addEventListener("wheel", (e) => {
       if (!e.metaKey) return;
@@ -229,7 +247,7 @@ var PlantUMLRendererPlugin = class extends import_obsidian.Plugin {
       tx = mx - (mx - tx) * (newScale / scale);
       ty = my - (my - ty) * (newScale / scale);
       scale = newScale;
-      apply();
+      scheduleZoom();
     }, { passive: false });
     let dragging = false, dragX = 0, dragY = 0, startTx = 0, startTy = 0;
     container.addEventListener("pointerdown", (e) => {
@@ -246,7 +264,8 @@ var PlantUMLRendererPlugin = class extends import_obsidian.Plugin {
       if (!dragging) return;
       tx = startTx + (e.clientX - dragX);
       ty = startTy + (e.clientY - dragY);
-      apply();
+      clamp();
+      applyTranslate();
     });
     container.addEventListener("pointerup", () => {
       dragging = false;
@@ -256,7 +275,7 @@ var PlantUMLRendererPlugin = class extends import_obsidian.Plugin {
       scale = minScale;
       tx = 0;
       ty = 0;
-      apply();
+      applyZoom();
     });
   }
   async resolveIncludes(source, filePath, seen = /* @__PURE__ */ new Set()) {
