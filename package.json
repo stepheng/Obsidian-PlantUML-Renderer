@@ -1,0 +1,17 @@
+{
+    "name": "obsidian-plantuml-renderer",
+    "version": "1.0.0",
+    "description": "Render PlantUML diagrams in Obsidian via local JAR",
+    "main": "main.js",
+    "scripts": {
+        "dev": "node esbuild.config.mjs",
+        "build": "tsc --noEmit --skipLibCheck && node esbuild.config.mjs production"
+    },
+    "devDependencies": {
+        "@types/node": "^22.0.0",
+        "builtin-modules": "^3.3.0",
+        "esbuild": "^0.21.0",
+        "obsidian": "latest",
+        "typescript": "^5.0.0"
+    }
+}
