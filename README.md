@@ -2,6 +2,20 @@
 
 Renders PlantUML diagrams in Obsidian using a local PlantUML JAR. Diagrams are written to a temporary file alongside the markdown so PlantUML resolves `!include` paths natively — no preprocessing required.
 
+## How it works
+
+When a `plantuml` code block is rendered, the plugin resolves all `!include` directives recursively before passing the source to PlantUML. Includes are resolved relative to the markdown file's location, matching PlantUML's own path semantics. Already-included files are tracked and skipped, providing `!include_once` semantics automatically.
+
+The resolved source is piped to a persistent PlantUML JAR process over stdin, and the SVG response is read back from stdout. Keeping the JVM alive across renders avoids the startup cost on every diagram.
+
+## Why JAR-direct?
+
+**Local PlantUML server** (e.g. `java -jar plantuml.jar -picoweb`) encodes diagrams in the request URL, which has an ~8 KB limit. Large diagrams with many `!include` files can exceed this and fail to render. It also requires a separate process to be running.
+
+**Remote rendering** (e.g. `plantuml.com`) requires sending diagram source over the internet, which may not be suitable for proprietary or confidential content.
+
+**JAR-direct** sidesteps the URL size constraint and keeps everything local, with `!include` resolution handled natively by PlantUML.
+
 ## Requirements
 
 - **Java** — available at `/usr/bin/java` or configured below
