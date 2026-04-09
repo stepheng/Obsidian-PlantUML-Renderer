@@ -152,6 +152,9 @@ export default class PlantUMLRendererPlugin extends Plugin {
             const svgMatch = svg.match(/<svg[\s\S]*<\/svg>/i);
             container.innerHTML = svgMatch ? svgMatch[0] : svg;
 
+            const svgEl = container.querySelector('svg');
+            if (svgEl) this.makeZoomable(container, svgEl as HTMLElement);
+
             if (svg.includes('Syntax Error?')) {
                 const svgStart = svg.indexOf('<svg');
                 const errorText = (svgStart > 0 ? svg.slice(0, svgStart).trim() : '')
@@ -169,6 +172,124 @@ export default class PlantUMLRendererPlugin extends Plugin {
                 cls: 'plantuml-error',
             });
         }
+    }
+
+    private makeZoomable(container: HTMLElement, svgEl: HTMLElement) {
+        const W = parseFloat(svgEl.getAttribute('width') ?? '800');
+        const H = parseFloat(svgEl.getAttribute('height') ?? '600');
+
+        if (!svgEl.hasAttribute('viewBox')) {
+            svgEl.setAttribute('viewBox', `0 0 ${W} ${H}`);
+        }
+        svgEl.removeAttribute('width');
+        svgEl.removeAttribute('height');
+        svgEl.style.width = `${W}px`;
+        svgEl.style.height = `${H}px`;
+        svgEl.style.display = 'block';
+        svgEl.style.transformOrigin = '0 0';
+
+        Object.assign(container.style, {
+            overflow: 'hidden',
+            cursor: 'grab',
+            position: 'relative',
+        });
+
+        // Custom resize handle — CSS resize doesn't work with overflow:hidden in Chrome
+        const handle = container.createDiv();
+        Object.assign(handle.style, {
+            position: 'absolute',
+            bottom: '0',
+            left: '0',
+            right: '0',
+            height: '6px',
+            cursor: 'ns-resize',
+            zIndex: '10',
+        });
+        let resizing = false, resizeStartY = 0, resizeStartH = 0;
+        handle.addEventListener('pointerdown', (e: PointerEvent) => {
+            resizing = true;
+            resizeStartY = e.clientY;
+            resizeStartH = container.clientHeight;
+            handle.setPointerCapture(e.pointerId);
+            e.stopPropagation();
+        });
+        handle.addEventListener('pointermove', (e: PointerEvent) => {
+            if (!resizing) return;
+            container.style.height = `${Math.max(80, resizeStartH + (e.clientY - resizeStartY))}px`;
+        });
+        handle.addEventListener('pointerup', () => { resizing = false; });
+        container.title = 'Cmd+Scroll to zoom · Drag to pan · Double-click to reset';
+
+        let scale = 1, tx = 0, ty = 0, minScale = 0.05;
+
+        // Clamp pan so diagram edges never retreat inside the container
+        const clamp = () => {
+            const cw = container.clientWidth;
+            const ch = container.clientHeight;
+            tx = Math.min(0, Math.max(tx, cw - W * scale));
+            ty = Math.min(0, Math.max(ty, ch - H * scale));
+        };
+
+        const apply = () => {
+            clamp();
+            svgEl.style.transform = `translate(${tx}px,${ty}px) scale(${scale})`;
+        };
+
+        // Initial fit-to-width; size container to the scaled diagram height
+        requestAnimationFrame(() => {
+            const cw = container.clientWidth || W;
+            scale = Math.min(1, cw / W);
+            minScale = scale;
+            const maxH = window.innerHeight * 0.6;
+            container.style.height = `${Math.min(H * scale, maxH)}px`;
+            apply();
+        });
+
+        // Cmd+scroll to zoom toward cursor; plain scroll scrolls the page
+        container.addEventListener('wheel', (e: WheelEvent) => {
+            if (!e.metaKey) return;
+            e.preventDefault();
+            const rect = container.getBoundingClientRect();
+            const mx = e.clientX - rect.left;
+            const my = e.clientY - rect.top;
+            const factor = e.deltaY < 0 ? 1.1 : 0.9;
+            const newScale = Math.max(minScale, Math.min(20, scale * factor));
+            tx = mx - (mx - tx) * (newScale / scale);
+            ty = my - (my - ty) * (newScale / scale);
+            scale = newScale;
+            apply();
+        }, { passive: false });
+
+        // Drag to pan
+        let dragging = false, dragX = 0, dragY = 0, startTx = 0, startTy = 0;
+
+        container.addEventListener('pointerdown', (e: PointerEvent) => {
+            if (e.button !== 0) return;
+            dragging = true;
+            dragX = e.clientX; dragY = e.clientY;
+            startTx = tx; startTy = ty;
+            container.setPointerCapture(e.pointerId);
+            container.style.cursor = 'grabbing';
+        });
+
+        container.addEventListener('pointermove', (e: PointerEvent) => {
+            if (!dragging) return;
+            tx = startTx + (e.clientX - dragX);
+            ty = startTy + (e.clientY - dragY);
+            apply();
+        });
+
+        container.addEventListener('pointerup', () => {
+            dragging = false;
+            container.style.cursor = 'grab';
+        });
+
+        // Double-click to reset to initial fit-to-width
+        container.addEventListener('dblclick', () => {
+            scale = minScale;
+            tx = 0; ty = 0;
+            apply();
+        });
     }
 
     private async resolveIncludes(source: string, filePath: string, seen = new Set<string>()): Promise<string> {

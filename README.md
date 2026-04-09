@@ -63,9 +63,20 @@ Bob --> Alice : Hi
 
 `!include` directives are resolved relative to the markdown file's location, so relative paths work exactly as they do when running PlantUML directly.
 
+## Diagram Navigation
+
+Rendered diagrams are interactive. Large diagrams are scaled down to fit the note width automatically.
+
+| Action | Effect |
+|--------|--------|
+| Cmd+Scroll | Zoom in / out toward the cursor |
+| Drag | Pan around the diagram |
+| Double-click | Reset to fit-to-width |
+| Drag bottom edge | Resize the container vertically |
+
 ## Error Output
 
-If PlantUML reports a syntax error, the error text is displayed below the error image in a readable block.
+PlantUML returns an SVG even on syntax errors — the error message is embedded in the image itself. The plugin renders it as-is; there is no separate error state.
 
 ## Notes
 
