@@ -1,12 +1,12 @@
 # Obsidian PlantUML Renderer
 
-Renders PlantUML diagrams in Obsidian using a local PlantUML JAR. Diagrams are written to a temporary file alongside the markdown so PlantUML resolves `!include` paths natively — no preprocessing required.
+Renders PlantUML diagrams in Obsidian using a local PlantUML JAR. The plugin resolves local `!include` files within the vault before sending diagrams to the JAR.
 
 ## How it works
 
-When a `plantuml` code block is rendered, the plugin resolves all `!include` directives recursively before passing the source to PlantUML. Includes are resolved relative to the markdown file's location, matching PlantUML's own path semantics. Already-included files are tracked and skipped, providing `!include_once` semantics automatically.
+When a `plantuml` code block is rendered, the plugin resolves local `!include` directives recursively before passing the source to PlantUML. Includes are resolved relative to the markdown file's location and must stay within the vault, including after symlinks are resolved. Already-included files are tracked and skipped, providing `!include_once` semantics automatically.
 
-The resolved source is piped to a persistent PlantUML JAR process over stdin, and the SVG response is read back from stdout. Keeping the JVM alive across renders avoids the startup cost on every diagram.
+The resolved source is piped to a persistent PlantUML JAR process over stdin, and the SVG response is read back from stdout. PlantUML runs with its `SANDBOX` security profile, which blocks the JAR from loading files or URLs itself. Keep shared includes inside the vault.
 
 ## Why JAR-direct?
 
@@ -14,7 +14,7 @@ The resolved source is piped to a persistent PlantUML JAR process over stdin, an
 
 **Remote rendering** (e.g. `plantuml.com`) requires sending diagram source over the internet, which may not be suitable for proprietary or confidential content.
 
-**JAR-direct** sidesteps the URL size constraint and keeps everything local, with `!include` resolution handled natively by PlantUML.
+**JAR-direct** sidesteps the URL size constraint and keeps everything local, with `!include` resolution handled by the plugin.
 
 ## Requirements
 
@@ -61,7 +61,7 @@ Bob --> Alice : Hi
 ```
 ~~~
 
-`!include` directives are resolved relative to the markdown file's location, so relative paths work exactly as they do when running PlantUML directly.
+`!include` directives are resolved relative to the markdown file's location. Relative parent paths work within the vault; absolute paths and paths outside the vault are rejected.
 
 ## Diagram Navigation
 
