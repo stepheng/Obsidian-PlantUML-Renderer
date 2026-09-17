@@ -317,6 +317,10 @@ var PlantUMLRendererPlugin = class extends import_obsidian.Plugin {
     for (const line of lines) {
       const m = line.match(/^\s*!include\s+(.+)$/);
       if (m) {
+        if (/^<[^<>]+>$/.test(m[1].trim())) {
+          out.push(line);
+          continue;
+        }
         const vaultRel = (0, import_obsidian.normalizePath)(await resolveVaultInclude(
           adapter.getBasePath(),
           filePath,

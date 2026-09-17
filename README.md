@@ -8,6 +8,8 @@ When a `plantuml` code block is rendered, the plugin resolves local `!include` d
 
 The resolved source is piped to a persistent PlantUML JAR process over stdin, and the SVG response is read back from stdout. PlantUML runs with its `SANDBOX` security profile, which blocks the JAR from loading files or URLs itself. Keep shared includes inside the vault.
 
+Bundled standard-library includes, such as `!include <archimate/Archimate>`, are passed to PlantUML and remain available in the sandbox.
+
 ## Why JAR-direct?
 
 **Local PlantUML server** (e.g. `java -jar plantuml.jar -picoweb`) encodes diagrams in the request URL, which has an ~8 KB limit. Large diagrams with many `!include` files can exceed this and fail to render. It also requires a separate process to be running.

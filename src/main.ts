@@ -325,6 +325,11 @@ export default class PlantUMLRendererPlugin extends Plugin {
         for (const line of lines) {
             const m = line.match(/^\s*!include\s+(.+)$/);
             if (m) {
+                // Bundled libraries are resolved by the sandboxed JAR, not the vault.
+                if (/^<[^<>]+>$/.test(m[1].trim())) {
+                    out.push(line);
+                    continue;
+                }
                 const vaultRel = normalizePath(await resolveVaultInclude(
                     adapter.getBasePath(), filePath, m[1].trim()
                 ));
