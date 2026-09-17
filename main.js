@@ -1,6 +1,8 @@
+var __create = Object.create;
 var __defProp = Object.defineProperty;
 var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
 var __getOwnPropNames = Object.getOwnPropertyNames;
+var __getProtoOf = Object.getPrototypeOf;
 var __hasOwnProp = Object.prototype.hasOwnProperty;
 var __export = (target, all) => {
   for (var name in all)
@@ -14,6 +16,14 @@ var __copyProps = (to, from, except, desc) => {
   }
   return to;
 };
+var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__getProtoOf(mod)) : {}, __copyProps(
+  // If the importer is in node compatibility mode or this is not an ESM
+  // file that has been converted to a CommonJS file using a Babel-
+  // compatible transform (i.e. "__esModule" has not been set), then set
+  // "default" to the CommonJS "module.exports" for node compatibility.
+  isNodeMode || !mod || !mod.__esModule ? __defProp(target, "default", { value: mod, enumerable: true }) : target,
+  mod
+));
 var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: true }), mod);
 
 // src/main.ts
@@ -24,6 +34,25 @@ __export(main_exports, {
 module.exports = __toCommonJS(main_exports);
 var import_obsidian = require("obsidian");
 var import_child_process = require("child_process");
+
+// src/IncludePaths.ts
+var import_promises = require("fs/promises");
+var path = __toESM(require("path"));
+async function resolveVaultInclude(vaultPath, notePath, includePath) {
+  const root = path.resolve(vaultPath);
+  if (path.isAbsolute(includePath)) throw new Error("Include is outside vault");
+  const candidate = path.resolve(root, path.dirname(notePath), includePath);
+  const inside = (location, base) => {
+    const relative2 = path.relative(base, location);
+    return relative2 === "" || relative2 !== ".." && !relative2.startsWith(`..${path.sep}`) && !path.isAbsolute(relative2);
+  };
+  if (!inside(candidate, root)) throw new Error("Include is outside vault");
+  const [realRoot, realCandidate] = await Promise.all([(0, import_promises.realpath)(root), (0, import_promises.realpath)(candidate)]);
+  if (!inside(realCandidate, realRoot)) throw new Error("Include is outside vault");
+  return path.relative(realRoot, realCandidate).split(path.sep).join("/");
+}
+
+// src/main.ts
 var DEFAULT_SETTINGS = {
   jarPath: "",
   javaPath: "/usr/bin/java",
@@ -40,8 +69,8 @@ var PlantUMLPipe = class {
     this.queue = [];
   }
   render(source) {
-    return new Promise((resolve, reject) => {
-      this.queue.push({ source, resolve, reject });
+    return new Promise((resolve2, reject) => {
+      this.queue.push({ source, resolve: resolve2, reject });
       if (!this.pending) this.next();
     });
   }
@@ -73,7 +102,7 @@ ${item.source}
   }
   ensureRunning() {
     if (this.proc && !this.proc.killed) return;
-    const args = ["-Dfile.encoding=UTF-8", "-jar", this.jarPath, "-tsvg", "-pipe"];
+    const args = ["-Dfile.encoding=UTF-8", "-DPLANTUML_SECURITY_PROFILE=SANDBOX", "-jar", this.jarPath, "-tsvg", "-pipe"];
     if (this.dotPath) args.push("-graphvizdot", this.dotPath);
     this.proc = (0, import_child_process.spawn)(this.javaPath, args);
     this.outBuf = "";
@@ -280,21 +309,28 @@ var PlantUMLRendererPlugin = class extends import_obsidian.Plugin {
   }
   async resolveIncludes(source, filePath, seen = /* @__PURE__ */ new Set()) {
     const adapter = this.app.vault.adapter;
-    const dir = filePath.contains("/") ? filePath.substring(0, filePath.lastIndexOf("/")) : "";
+    if (!(adapter instanceof import_obsidian.FileSystemAdapter)) {
+      throw new Error("Local PlantUML includes require a desktop vault");
+    }
     const lines = source.split("\n");
     const out = [];
     for (const line of lines) {
       const m = line.match(/^\s*!include\s+(.+)$/);
       if (m) {
-        const vaultRel = (0, import_obsidian.normalizePath)(joinPath(dir, m[1].trim()));
-        if (seen.has(vaultRel)) continue;
-        try {
-          const content = await adapter.read(vaultRel);
-          seen.add(vaultRel);
-          out.push(await this.resolveIncludes(content, vaultRel, seen));
+        if (/^<[^<>]+>$/.test(m[1].trim())) {
+          out.push(line);
           continue;
-        } catch (e) {
         }
+        const vaultRel = (0, import_obsidian.normalizePath)(await resolveVaultInclude(
+          adapter.getBasePath(),
+          filePath,
+          m[1].trim()
+        ));
+        if (seen.has(vaultRel)) continue;
+        const content = await adapter.read(vaultRel);
+        seen.add(vaultRel);
+        out.push(await this.resolveIncludes(content, vaultRel, seen));
+        continue;
       }
       out.push(line);
     }
@@ -308,14 +344,6 @@ var PlantUMLRendererPlugin = class extends import_obsidian.Plugin {
     this.startPipe();
   }
 };
-function joinPath(dir, rel) {
-  const parts = dir ? dir.split("/") : [];
-  for (const seg of rel.split("/")) {
-    if (seg === "..") parts.pop();
-    else if (seg !== ".") parts.push(seg);
-  }
-  return parts.join("/");
-}
 var SettingsTab = class extends import_obsidian.PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);

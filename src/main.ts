@@ -1,5 +1,6 @@
 import {
     App,
+    FileSystemAdapter,
     normalizePath,
     Plugin,
     PluginSettingTab,
@@ -7,6 +8,7 @@ import {
     type MarkdownPostProcessorContext,
 } from 'obsidian';
 import { spawn, type ChildProcess } from 'child_process';
+import { resolveVaultInclude } from './IncludePaths';
 
 interface Settings {
     jarPath: string;
@@ -74,7 +76,7 @@ class PlantUMLPipe {
     private ensureRunning() {
         if (this.proc && !this.proc.killed) return;
 
-        const args = ['-Dfile.encoding=UTF-8', '-jar', this.jarPath, '-tsvg', '-pipe'];
+        const args = ['-Dfile.encoding=UTF-8', '-DPLANTUML_SECURITY_PROFILE=SANDBOX', '-jar', this.jarPath, '-tsvg', '-pipe'];
         if (this.dotPath) args.push('-graphvizdot', this.dotPath);
 
         this.proc = spawn(this.javaPath, args);
@@ -315,24 +317,27 @@ export default class PlantUMLRendererPlugin extends Plugin {
 
     private async resolveIncludes(source: string, filePath: string, seen = new Set<string>()): Promise<string> {
         const adapter = this.app.vault.adapter;
-        const dir = filePath.contains('/')
-            ? filePath.substring(0, filePath.lastIndexOf('/'))
-            : '';
+        if (!(adapter instanceof FileSystemAdapter)) {
+            throw new Error('Local PlantUML includes require a desktop vault');
+        }
         const lines = source.split('\n');
         const out: string[] = [];
         for (const line of lines) {
             const m = line.match(/^\s*!include\s+(.+)$/);
             if (m) {
-                const vaultRel = normalizePath(joinPath(dir, m[1].trim()));
-                if (seen.has(vaultRel)) continue;
-                try {
-                    const content = await adapter.read(vaultRel);
-                    seen.add(vaultRel);
-                    out.push(await this.resolveIncludes(content, vaultRel, seen));
+                // Bundled libraries are resolved by the sandboxed JAR, not the vault.
+                if (/^<[^<>]+>$/.test(m[1].trim())) {
+                    out.push(line);
                     continue;
-                } catch {
-                    // Not found in vault — pass through to JAR
                 }
+                const vaultRel = normalizePath(await resolveVaultInclude(
+                    adapter.getBasePath(), filePath, m[1].trim()
+                ));
+                if (seen.has(vaultRel)) continue;
+                const content = await adapter.read(vaultRel);
+                seen.add(vaultRel);
+                out.push(await this.resolveIncludes(content, vaultRel, seen));
+                continue;
             }
             out.push(line);
         }
@@ -347,19 +352,6 @@ export default class PlantUMLRendererPlugin extends Plugin {
         await this.saveData(this.settings);
         this.startPipe();
     }
-}
-
-// ---------------------------------------------------------------------------
-// Path helpers
-// ---------------------------------------------------------------------------
-
-function joinPath(dir: string, rel: string): string {
-    const parts = dir ? dir.split('/') : [];
-    for (const seg of rel.split('/')) {
-        if (seg === '..') parts.pop();
-        else if (seg !== '.') parts.push(seg);
-    }
-    return parts.join('/');
 }
 
 // ---------------------------------------------------------------------------
