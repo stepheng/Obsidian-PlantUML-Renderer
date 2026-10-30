@@ -1,9 +1,9 @@
 {
     "id": "obsidian-plantuml-renderer",
     "name": "Obsidian PlantUML Renderer",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "minAppVersion": "1.0.0",
-    "description": "Render PlantUML diagrams via local JAR with native !include resolution",
+    "description": "Render PlantUML diagrams via a local native binary or JAR, with vault !include resolution",
     "author": "Stephen Gurnett",
     "authorUrl": "",
     "isDesktopOnly": true
