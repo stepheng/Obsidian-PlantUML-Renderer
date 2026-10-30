@@ -33,7 +33,17 @@ __export(main_exports, {
 });
 module.exports = __toCommonJS(main_exports);
 var import_obsidian = require("obsidian");
-var import_child_process = require("child_process");
+var import_crypto = require("crypto");
+
+// src/DiagramBlock.ts
+function firstBlock(lines) {
+  const start = lines.findIndex((l) => /^\s*@start\w+/i.test(l));
+  if (start < 0) return null;
+  const type = lines[start].match(/@start(\w+)/i)[1];
+  const endLine = new RegExp(`^\\s*@end${type}\\s*$`, "i");
+  const end = lines.findIndex((l, i) => i > start && endLine.test(l));
+  return { type, start, end };
+}
 
 // src/IncludePaths.ts
 var import_promises = require("fs/promises");
@@ -52,17 +62,24 @@ async function resolveVaultInclude(vaultPath, notePath, includePath) {
   return path.relative(realRoot, realCandidate).split(path.sep).join("/");
 }
 
-// src/main.ts
-var DEFAULT_SETTINGS = {
-  jarPath: "",
-  javaPath: "/usr/bin/java",
-  dotPath: "/opt/homebrew/bin/dot"
-};
+// src/PlantUMLPipe.ts
+var import_child_process = require("child_process");
+function terminate(source) {
+  const lines = source.split("\n");
+  const block = firstBlock(lines);
+  if (!block) return `@startuml
+${source}
+@enduml`;
+  if (block.end < 0) return [...lines.slice(block.start), `@end${block.type}`].join("\n");
+  return lines.slice(block.start, block.end + 1).join("\n");
+}
 var PlantUMLPipe = class {
-  constructor(javaPath, jarPath, dotPath) {
+  constructor(javaPath, jarPath, dotPath, nativePath = "", layout = "graphviz") {
     this.javaPath = javaPath;
     this.jarPath = jarPath;
     this.dotPath = dotPath;
+    this.nativePath = nativePath;
+    this.layout = layout;
     this.proc = null;
     this.outBuf = "";
     this.pending = null;
@@ -90,10 +107,7 @@ var PlantUMLPipe = class {
     this.pending = item;
     try {
       this.ensureRunning();
-      const wrapped = /^\s*@startuml/i.test(item.source) ? item.source : `@startuml
-${item.source}
-@enduml`;
-      this.proc.stdin.write(wrapped + "\n");
+      this.proc.stdin.write(terminate(item.source) + "\n");
     } catch (err) {
       this.pending = null;
       item.reject(err instanceof Error ? err : new Error(String(err)));
@@ -102,22 +116,35 @@ ${item.source}
   }
   ensureRunning() {
     if (this.proc && !this.proc.killed) return;
-    const args = ["-Dfile.encoding=UTF-8", "-DPLANTUML_SECURITY_PROFILE=SANDBOX", "-jar", this.jarPath, "-tsvg", "-pipe"];
-    if (this.dotPath) args.push("-graphvizdot", this.dotPath);
-    this.proc = (0, import_child_process.spawn)(this.javaPath, args);
+    const args = ["-Dfile.encoding=UTF-8", "-DPLANTUML_SECURITY_PROFILE=SANDBOX"];
+    if (!this.nativePath) args.push("-jar", this.jarPath);
+    args.push("-tsvg", "-pipe");
+    if (this.layout === "smetana") args.push("-Playout=smetana");
+    else if (this.dotPath) args.push("-graphvizdot", this.dotPath);
+    this.proc = (0, import_child_process.spawn)(this.nativePath || this.javaPath, args);
     this.outBuf = "";
     this.proc.stdout.on("data", (chunk) => {
       this.outBuf += chunk.toString("utf-8");
-      const end = this.outBuf.indexOf("</svg>");
-      if (end === -1) return;
-      const svg = this.outBuf.slice(0, end + 6);
-      this.outBuf = this.outBuf.slice(end + 6);
-      const p = this.pending;
-      this.pending = null;
-      p.resolve(svg);
-      this.next();
+      let end;
+      while ((end = this.outBuf.indexOf("</svg>")) !== -1) {
+        const svg = this.outBuf.slice(0, end + 6);
+        this.outBuf = this.outBuf.slice(end + 6);
+        if (!this.pending) break;
+        const p = this.pending;
+        this.pending = null;
+        p.resolve(svg);
+        this.next();
+      }
     });
     this.proc.stderr.on("data", () => {
+    });
+    this.proc.stdin.on("error", (err) => {
+      const p = this.pending;
+      this.pending = null;
+      this.proc = null;
+      p == null ? void 0 : p.reject(err);
+      this.queue.forEach((item) => item.reject(err));
+      this.queue = [];
     });
     this.proc.on("error", (err) => {
       const p = this.pending;
@@ -129,15 +156,41 @@ ${item.source}
     });
     this.proc.on("close", (code) => {
       this.proc = null;
+      const err = new Error(`PlantUML process exited unexpectedly (code ${code})`);
       if (this.pending) {
         const p = this.pending;
         this.pending = null;
-        p.reject(new Error(`PlantUML process exited unexpectedly (code ${code})`));
-        if (this.queue.length > 0) this.next();
+        p.reject(err);
       }
+      this.queue.forEach((item) => item.reject(err));
+      this.queue = [];
     });
   }
 };
+
+// src/main.ts
+var DEFAULT_SETTINGS = {
+  nativePath: "",
+  jarPath: "",
+  javaPath: "/usr/bin/java",
+  dotPath: "/opt/homebrew/bin/dot",
+  layoutEngine: "graphviz"
+};
+function guard(vaultPath, content) {
+  const id = `$__include_${(0, import_crypto.createHash)("sha1").update(vaultPath).digest("hex").slice(0, 12)}`;
+  return `!if %not(%variable_exists("${id}"))
+!global ${id} = %true()
+${content}
+!endif`;
+}
+function unwrap(content) {
+  const lines = content.split("\n");
+  const block = firstBlock(lines);
+  if (!block) return content;
+  return lines.slice(block.start + 1, block.end < 0 ? void 0 : block.end).join("\n");
+}
+var OPENS = /^\s*!(?:if|ifdef|ifndef|while|foreach|procedure|function|unquoted\s+(?:procedure|function))\b(?!.*!return\b)/i;
+var CLOSES = /^\s*!(?:endif|endwhile|endfor|endprocedure|endfunction)\b/i;
 var CACHE_LIMIT = 30;
 var PlantUMLRendererPlugin = class extends import_obsidian.Plugin {
   constructor() {
@@ -161,12 +214,13 @@ var PlantUMLRendererPlugin = class extends import_obsidian.Plugin {
     var _a;
     (_a = this.pipe) == null ? void 0 : _a.kill();
     this.svgCache.clear();
-    this.pipe = this.settings.jarPath ? new PlantUMLPipe(this.settings.javaPath, this.settings.jarPath, this.settings.dotPath) : null;
+    const { nativePath, javaPath, jarPath, dotPath, layoutEngine } = this.settings;
+    this.pipe = nativePath || jarPath ? new PlantUMLPipe(javaPath, jarPath, dotPath, nativePath, layoutEngine) : null;
   }
   async render(source, el, ctx) {
     var _a, _b, _c, _d, _e;
     try {
-      if (!this.pipe) throw new Error("JAR path not configured \u2014 set it in plugin settings.");
+      if (!this.pipe) throw new Error("PlantUML not configured \u2014 set the native binary or JAR path in plugin settings.");
       const resolved = await this.resolveIncludes(source, ctx.sourcePath);
       let svg = this.svgCache.get(resolved);
       if (!svg) {
@@ -307,15 +361,21 @@ var PlantUMLRendererPlugin = class extends import_obsidian.Plugin {
       applyZoom();
     });
   }
-  async resolveIncludes(source, filePath, seen = /* @__PURE__ */ new Set()) {
+  resolveIncludes(source, filePath) {
+    return this.resolve(source, filePath, { ancestors: /* @__PURE__ */ new Set(), depth: 0, unconditional: /* @__PURE__ */ new Set() });
+  }
+  async resolve(source, filePath, state) {
     const adapter = this.app.vault.adapter;
     if (!(adapter instanceof import_obsidian.FileSystemAdapter)) {
       throw new Error("Local PlantUML includes require a desktop vault");
     }
     const lines = source.split("\n");
     const out = [];
+    let depth = state.depth;
     for (const line of lines) {
-      const m = line.match(/^\s*!include\s+(.+)$/);
+      if (OPENS.test(line)) depth++;
+      else if (CLOSES.test(line)) depth = Math.max(state.depth, depth - 1);
+      const m = line.match(/^\s*!include(?:_once)?\s+(.+)$/);
       if (m) {
         if (/^<[^<>]+>$/.test(m[1].trim())) {
           out.push(line);
@@ -326,10 +386,15 @@ var PlantUMLRendererPlugin = class extends import_obsidian.Plugin {
           filePath,
           m[1].trim()
         ));
-        if (seen.has(vaultRel)) continue;
+        if (state.ancestors.has(vaultRel) || state.unconditional.has(vaultRel)) continue;
         const content = await adapter.read(vaultRel);
-        seen.add(vaultRel);
-        out.push(await this.resolveIncludes(content, vaultRel, seen));
+        const nested = await this.resolve(unwrap(content), vaultRel, {
+          ...state,
+          ancestors: /* @__PURE__ */ new Set([...state.ancestors, vaultRel]),
+          depth
+        });
+        if (depth === 0) state.unconditional.add(vaultRel);
+        out.push(guard(vaultRel, nested));
         continue;
       }
       out.push(line);
@@ -353,6 +418,12 @@ var SettingsTab = class extends import_obsidian.PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
     containerEl.createEl("h2", { text: "PlantUML" });
+    new import_obsidian.Setting(containerEl).setName("Native PlantUML path").setDesc("Absolute path to a native PlantUML executable. When set, no Java is needed and the JAR and Java paths are ignored.").addText(
+      (text) => text.setPlaceholder("/path/to/plantuml").setValue(this.plugin.settings.nativePath).onChange(async (value) => {
+        this.plugin.settings.nativePath = value.trim();
+        await this.plugin.saveSettings();
+      })
+    );
     new import_obsidian.Setting(containerEl).setName("PlantUML JAR path").setDesc("Absolute path to plantuml.jar.").addText(
       (text) => text.setPlaceholder("/path/to/plantuml.jar").setValue(this.plugin.settings.jarPath).onChange(async (value) => {
         this.plugin.settings.jarPath = value.trim();
@@ -368,6 +439,12 @@ var SettingsTab = class extends import_obsidian.PluginSettingTab {
     new import_obsidian.Setting(containerEl).setName("Graphviz dot path").setDesc("Absolute path to the dot executable.").addText(
       (text) => text.setPlaceholder("/opt/homebrew/bin/dot").setValue(this.plugin.settings.dotPath).onChange(async (value) => {
         this.plugin.settings.dotPath = value.trim();
+        await this.plugin.saveSettings();
+      })
+    );
+    new import_obsidian.Setting(containerEl).setName("Layout engine").setDesc("Smetana is PlantUML's built-in layout: no Graphviz needed and faster rendering, but layouts can differ.").addDropdown(
+      (dropdown) => dropdown.addOption("graphviz", "Graphviz").addOption("smetana", "Smetana").setValue(this.plugin.settings.layoutEngine).onChange(async (value) => {
+        this.plugin.settings.layoutEngine = value;
         await this.plugin.saveSettings();
       })
     );

@@ -7,114 +7,60 @@ import {
     Setting,
     type MarkdownPostProcessorContext,
 } from 'obsidian';
-import { spawn, type ChildProcess } from 'child_process';
+import { createHash } from 'crypto';
+import { firstBlock } from './DiagramBlock';
 import { resolveVaultInclude } from './IncludePaths';
+import { PlantUMLPipe } from './PlantUMLPipe';
 
 interface Settings {
+    nativePath: string;
     jarPath: string;
     javaPath: string;
     dotPath: string;
+    layoutEngine: 'graphviz' | 'smetana';
 }
 
 const DEFAULT_SETTINGS: Settings = {
+    nativePath: '',
     jarPath: '',
     javaPath: '/usr/bin/java',
     dotPath: '/opt/homebrew/bin/dot',
+    layoutEngine: 'graphviz',
 };
 
 // ---------------------------------------------------------------------------
-// Persistent PlantUML pipe process
-// One JVM per plugin lifetime. Diagrams are serialised through a queue.
+// Include resolution
 // ---------------------------------------------------------------------------
 
-class PlantUMLPipe {
-    private proc: ChildProcess | null = null;
-    private outBuf = '';
-    private pending: { resolve: (s: string) => void; reject: (e: Error) => void } | null = null;
-    private queue: Array<{ source: string; resolve: (s: string) => void; reject: (e: Error) => void }> = [];
+// PlantUML includes each file once, but only where an !include is actually reached
+// (a file can sit in several !if branches). Deduplicating here, before !if is
+// evaluated, would drop it from whichever branch is active, so each inlined copy
+// carries a preprocessor guard and PlantUML skips the repeats itself.
+function guard(vaultPath: string, content: string): string {
+    const id = `$__include_${createHash('sha1').update(vaultPath).digest('hex').slice(0, 12)}`;
+    return `!if %not(%variable_exists("${id}"))\n!global ${id} = %true()\n${content}\n!endif`;
+}
 
-    constructor(
-        private javaPath: string,
-        private jarPath: string,
-        private dotPath: string,
-    ) {}
+// Like PlantUML, take only the first block's body from a file wrapped in @start/@end;
+// inlining the wrapper would end the including diagram at the included @end line.
+function unwrap(content: string): string {
+    const lines = content.split('\n');
+    const block = firstBlock(lines);
+    if (!block) return content;
+    return lines.slice(block.start + 1, block.end < 0 ? undefined : block.end).join('\n');
+}
 
-    render(source: string): Promise<string> {
-        return new Promise((resolve, reject) => {
-            this.queue.push({ source, resolve, reject });
-            if (!this.pending) this.next();
-        });
-    }
+// Lines that open or close a block whose body may run zero or many times.
+// A one-line `!function $f() !return …` opens nothing.
+const OPENS = /^\s*!(?:if|ifdef|ifndef|while|foreach|procedure|function|unquoted\s+(?:procedure|function))\b(?!.*!return\b)/i;
+const CLOSES = /^\s*!(?:endif|endwhile|endfor|endprocedure|endfunction)\b/i;
 
-    kill() {
-        this.proc?.kill();
-        this.proc = null;
-        const err = new Error('PlantUML pipe closed');
-        this.pending?.reject(err);
-        this.pending = null;
-        this.queue.forEach(item => item.reject(err));
-        this.queue = [];
-    }
-
-    private next() {
-        if (this.queue.length === 0) return;
-        const item = this.queue.shift()!;
-        this.pending = item;
-        try {
-            this.ensureRunning();
-            const wrapped = /^\s*@startuml/i.test(item.source)
-                ? item.source
-                : `@startuml\n${item.source}\n@enduml`;
-            this.proc!.stdin!.write(wrapped + '\n');
-        } catch (err) {
-            this.pending = null;
-            item.reject(err instanceof Error ? err : new Error(String(err)));
-            this.next();
-        }
-    }
-
-    private ensureRunning() {
-        if (this.proc && !this.proc.killed) return;
-
-        const args = ['-Dfile.encoding=UTF-8', '-DPLANTUML_SECURITY_PROFILE=SANDBOX', '-jar', this.jarPath, '-tsvg', '-pipe'];
-        if (this.dotPath) args.push('-graphvizdot', this.dotPath);
-
-        this.proc = spawn(this.javaPath, args);
-        this.outBuf = '';
-
-        this.proc.stdout!.on('data', (chunk: Buffer) => {
-            this.outBuf += chunk.toString('utf-8');
-            const end = this.outBuf.indexOf('</svg>');
-            if (end === -1) return;
-            const svg = this.outBuf.slice(0, end + 6);
-            this.outBuf = this.outBuf.slice(end + 6);
-            const p = this.pending!;
-            this.pending = null;
-            p.resolve(svg);
-            this.next();
-        });
-
-        this.proc.stderr!.on('data', () => {});
-
-        this.proc.on('error', (err) => {
-            const p = this.pending;
-            this.pending = null;
-            this.proc = null;
-            p?.reject(err);
-            this.queue.forEach(item => item.reject(err));
-            this.queue = [];
-        });
-
-        this.proc.on('close', (code) => {
-            this.proc = null;
-            if (this.pending) {
-                const p = this.pending;
-                this.pending = null;
-                p.reject(new Error(`PlantUML process exited unexpectedly (code ${code})`));
-                if (this.queue.length > 0) this.next();
-            }
-        });
-    }
+interface IncludeState {
+    ancestors: Set<string>;
+    /** Open conditional/loop/procedure blocks enclosing the current line, across all including files */
+    depth: number;
+    /** Files already inlined outside any such block: PlantUML is certain to skip any later copy */
+    unconditional: Set<string>;
 }
 
 // ---------------------------------------------------------------------------
@@ -144,14 +90,15 @@ export default class PlantUMLRendererPlugin extends Plugin {
     startPipe() {
         this.pipe?.kill();
         this.svgCache.clear();
-        this.pipe = this.settings.jarPath
-            ? new PlantUMLPipe(this.settings.javaPath, this.settings.jarPath, this.settings.dotPath)
+        const { nativePath, javaPath, jarPath, dotPath, layoutEngine } = this.settings;
+        this.pipe = nativePath || jarPath
+            ? new PlantUMLPipe(javaPath, jarPath, dotPath, nativePath, layoutEngine)
             : null;
     }
 
     private async render(source: string, el: HTMLElement, ctx: MarkdownPostProcessorContext) {
         try {
-            if (!this.pipe) throw new Error('JAR path not configured — set it in plugin settings.');
+            if (!this.pipe) throw new Error('PlantUML not configured — set the native binary or JAR path in plugin settings.');
             const resolved = await this.resolveIncludes(source, ctx.sourcePath);
             let svg = this.svgCache.get(resolved);
             if (!svg) {
@@ -315,15 +262,22 @@ export default class PlantUMLRendererPlugin extends Plugin {
         });
     }
 
-    private async resolveIncludes(source: string, filePath: string, seen = new Set<string>()): Promise<string> {
+    private resolveIncludes(source: string, filePath: string): Promise<string> {
+        return this.resolve(source, filePath, { ancestors: new Set(), depth: 0, unconditional: new Set() });
+    }
+
+    private async resolve(source: string, filePath: string, state: IncludeState): Promise<string> {
         const adapter = this.app.vault.adapter;
         if (!(adapter instanceof FileSystemAdapter)) {
             throw new Error('Local PlantUML includes require a desktop vault');
         }
         const lines = source.split('\n');
         const out: string[] = [];
+        let depth = state.depth;
         for (const line of lines) {
-            const m = line.match(/^\s*!include\s+(.+)$/);
+            if (OPENS.test(line)) depth++;
+            else if (CLOSES.test(line)) depth = Math.max(state.depth, depth - 1);
+            const m = line.match(/^\s*!include(?:_once)?\s+(.+)$/);
             if (m) {
                 // Bundled libraries are resolved by the sandboxed JAR, not the vault.
                 if (/^<[^<>]+>$/.test(m[1].trim())) {
@@ -333,10 +287,13 @@ export default class PlantUMLRendererPlugin extends Plugin {
                 const vaultRel = normalizePath(await resolveVaultInclude(
                     adapter.getBasePath(), filePath, m[1].trim()
                 ));
-                if (seen.has(vaultRel)) continue;
+                if (state.ancestors.has(vaultRel) || state.unconditional.has(vaultRel)) continue; // cycle, or certain repeat
                 const content = await adapter.read(vaultRel);
-                seen.add(vaultRel);
-                out.push(await this.resolveIncludes(content, vaultRel, seen));
+                const nested = await this.resolve(unwrap(content), vaultRel, {
+                    ...state, ancestors: new Set([...state.ancestors, vaultRel]), depth,
+                });
+                if (depth === 0) state.unconditional.add(vaultRel);
+                out.push(guard(vaultRel, nested));
                 continue;
             }
             out.push(line);
@@ -370,6 +327,19 @@ class SettingsTab extends PluginSettingTab {
         const { containerEl } = this;
         containerEl.empty();
         containerEl.createEl('h2', { text: 'PlantUML' });
+
+        new Setting(containerEl)
+            .setName('Native PlantUML path')
+            .setDesc('Absolute path to a native PlantUML executable. When set, no Java is needed and the JAR and Java paths are ignored.')
+            .addText(text =>
+                text
+                    .setPlaceholder('/path/to/plantuml')
+                    .setValue(this.plugin.settings.nativePath)
+                    .onChange(async (value) => {
+                        this.plugin.settings.nativePath = value.trim();
+                        await this.plugin.saveSettings();
+                    })
+            );
 
         new Setting(containerEl)
             .setName('PlantUML JAR path')
@@ -406,6 +376,20 @@ class SettingsTab extends PluginSettingTab {
                     .setValue(this.plugin.settings.dotPath)
                     .onChange(async (value) => {
                         this.plugin.settings.dotPath = value.trim();
+                        await this.plugin.saveSettings();
+                    })
+            );
+
+        new Setting(containerEl)
+            .setName('Layout engine')
+            .setDesc('Smetana is PlantUML\'s built-in layout: no Graphviz needed and faster rendering, but layouts can differ.')
+            .addDropdown(dropdown =>
+                dropdown
+                    .addOption('graphviz', 'Graphviz')
+                    .addOption('smetana', 'Smetana')
+                    .setValue(this.plugin.settings.layoutEngine)
+                    .onChange(async (value) => {
+                        this.plugin.settings.layoutEngine = value as Settings['layoutEngine'];
                         await this.plugin.saveSettings();
                     })
             );
