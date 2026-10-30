@@ -1,6 +1,6 @@
 {
     "name": "obsidian-plantuml-renderer",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "description": "Render PlantUML diagrams in Obsidian via a local native binary or JAR",
     "main": "main.js",
     "scripts": {
